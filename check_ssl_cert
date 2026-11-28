@@ -26,7 +26,7 @@
 ################################################################################
 # Constants
 
-VERSION=2.103.6
+VERSION=2.103.7
 SHORTNAME="SSL_CERT"
 
 # reset possibly set variables
@@ -47,8 +47,11 @@ CRITICAL_MSG=""
 DAYS_VALID_END_DATE=""
 DEBUG=0
 DEBUG_FILE=""
+DAYS_VALID=""
 DEFAULT_REQUIRED_HTTP_HEADERS="strict-transport-security,Content-Security-Policy,X-Content-Type-Options,Referrer-Policy,Permissions-Policy"
 DEFAULT_UNREQUIRED_HTTP_HEADERS="X-Powered-By,X-Aspnet-Version,X-XSS-Protection,X-AspNetMvc-Version"
+EARLIEST_VALIDITY_DATE=""
+EARLIEST_VALIDITY_ELEMENT=1
 EARLIEST_VALIDITY_HOURS=""
 HOST_CACHE="${HOME}/.check_ssl_cert-cache"
 REQUIRED_HTTP_HEADERS=""
@@ -62,7 +65,9 @@ TEMPFILE=""
 WARNING_MSG=""
 FINGERPRINT_ALG=sha1
 
-DEFAULT_FORMAT="%SHORTNAME% %STATUS% - %HOST%:%PORT%, %PROTOCOL%, %OPENSSL_COMMAND% %SELFSIGNEDCERT%certificate %DISPLAY_CN%%CHECKEDNAMES%from '%CA_ISSUER_MATCHED%' valid until %DATE%%DAYS_VALID%%OCSP_EXPIRES_IN_HOURS%%SSL_LABS_HOST_GRADE%"
+DEFAULT_FORMAT_PREFIX="%SHORTNAME% %STATUS% - %HOST%:%PORT%, %PROTOCOL%, %OPENSSL_COMMAND% %SELFSIGNEDCERT%certificate %DISPLAY_CN%%CHECKEDNAMES%from '%CA_ISSUER_MATCHED%'"
+DEFAULT_FORMAT_SUFFIX=" valid until %DATE%%DAYS_VALID%%OCSP_EXPIRES_IN_HOURS%%SSL_LABS_HOST_GRADE%"
+DEFAULT_FORMAT="${DEFAULT_FORMAT_PREFIX}${DEFAULT_FORMAT_SUFFIX}"
 
 # if --critical or --warning are floating point then switch to floating point output, otherwise integer
 
@@ -306,7 +311,8 @@ usage() {
     echo "   -C,--clientcert path            Use client certificate to authenticate"
     echo "   -c,--critical days              Minimum number of days a certificate has"
     echo "                                   to be valid to issue a critical status."
-    echo "                                   Can be a floating point number, e.g., 0.5"
+    echo "                                   Can be fractional days, e.g., 0.5, or a"
+    echo "                                   percentage of lifetime remaining, e.g., 10%"
     echo "                                   Default: ${CRITICAL_DAYS}"
     echo "      --check-chain                The certificate chain cannot contain"
     echo "                                   double or root certificates"
@@ -576,7 +582,8 @@ usage() {
     # Delimiter at 78 chars ############################################################
     echo "   -w,--warning days               Minimum number of days a certificate has"
     echo "                                   to be valid to issue a warning status."
-    echo "                                   Can be a floating point number, e.g., 0.5"
+    echo "                                   Can be fractional days, e.g., 0.5, or a"
+    echo "                                   percentage of lifetime remaining, e.g., 10%"
     echo "                                   Default: ${WARNING_DAYS}"
     # Delimiter at 78 chars ############################################################
     echo "      --xmpphost name              Specify the host for the 'to' attribute"
@@ -875,7 +882,7 @@ create_temporary_file() {
 # Compute the number of hours until a given date
 # Params
 #   $1 date
-# sets HOURS_UNTIL
+# sets HOURS_UNTIL and DATE_SECONDS (the parsed date as Unix time)
 hours_until() {
 
     HU_DATE=$1
@@ -973,25 +980,28 @@ hours_until() {
         fi
 
         # Warning: some shell script formatting tools will indent the EOF! (should be at position 0)
-        if ! HOURS_UNTIL=$(
+        if ! PERL_DATE=$(
             perl - "${HU_DATE}" <<-"EOF"
                                     use strict;
                                     use warnings;
                                     use Date::Parse;
                                     my $cert_date = str2time( $ARGV[0] );
                                     my $hours = int (( $cert_date - time ) / 3600 + 0.5);
-                                    print "$hours\n";
+                                    print "$cert_date $hours\n";
 EOF
         ); then
             # something went wrong with the embedded Perl code: check the indentation of EOF
             unknown "Error computing the certificate validity with Perl"
         fi
+        target_date=${PERL_DATE% *}
+        HOURS_UNTIL=${PERL_DATE#* }
         ;;
     *)
         unknown "Internal error: unknown date type"
         ;;
     esac
 
+    DATE_SECONDS=${target_date}
     debuglog "Hours until ${HU_DATE}: ${HOURS_UNTIL}"
 
 }
@@ -1004,6 +1014,12 @@ EOF
 days_to_seconds() {
 
     NUMBER_OF_DAYS=$1
+
+    # Percentage thresholds are resolved separately for each certificate.
+    case "${NUMBER_OF_DAYS}" in
+    *%) return ;;
+    *) ;;
+    esac
 
     if echo "${NUMBER_OF_DAYS}" | "${GREP_BIN}" -q '^[0-9][0-9]*$'; then
         debuglog "Converting ${NUMBER_OF_DAYS} days into seconds by shell function"
@@ -1500,7 +1516,7 @@ check_integer() {
 check_numeric_argument() {
     value=$1
     message=$2
-    if ! echo "${value}" | "${GREP_BIN}" -q -E '^[0-9][0-9]*([.][0-9][0-9]*)?[%]*$'; then
+    if ! echo "${value}" | "${GREP_BIN}" -q -E '^[0-9][0-9]*([.][0-9][0-9]*)?%?$'; then
         if [ -n "${UNIT_TEST}" ]; then
             return 0
         else
@@ -1508,9 +1524,8 @@ check_numeric_argument() {
         fi
     else
         if echo "${value}" | "${GREP_BIN}" -q -E '%$'; then
-            number=$(echo "${value}" | sed -e 's/%$//')     # remove the % sign at the end
-            number=$(echo "${number}" | sed -e 's/[.].*//') # remove the decimal part
-            if [ "${number}" -gt 100 ]; then
+            number=$(echo "${value}" | sed -e 's/%$//') # remove the % sign at the end
+            if awk -v number="${number}" 'BEGIN {exit !(number > 100)}'; then
                 if [ -n "${UNIT_TEST}" ]; then
                     return 0
                 else
@@ -1751,7 +1766,11 @@ extract_cert_attribute() {
         ;;
 
     startdate)
-        echo "${cert_content}" | "${OPENSSL}" "${OPENSSL_COMMAND}" -in /dev/stdin -noout ${OPENSSL_PARAMS} -startdate | sed -e "s/^notBefore=//"
+        if [ "${OPENSSL_COMMAND}" = 'crl' ]; then
+            echo "${cert_content}" | "${OPENSSL}" crl -in /dev/stdin -noout ${OPENSSL_PARAMS} -lastupdate | sed -e "s/^lastUpdate=//"
+        else
+            echo "${cert_content}" | "${OPENSSL}" "${OPENSSL_COMMAND}" -in /dev/stdin -noout ${OPENSSL_PARAMS} -startdate | sed -e "s/^notBefore=//"
+        fi
         ;;
     enddate)
         echo "${cert_content}" | "${OPENSSL}" "${OPENSSL_COMMAND}" -in /dev/stdin -noout ${OPENSSL_PARAMS} "${OPENSSL_ENDDATE_OPTION}" | sed -e "s/^notAfter=//" -e "s/^nextUpdate=//"
@@ -2481,17 +2500,53 @@ check_cert_end_date() {
 
     if [ -z "${EARLIEST_VALIDITY_HOURS}" ] || compare "${HOURS_UNTIL}" "<" "${EARLIEST_VALIDITY_HOURS}"; then
         EARLIEST_VALIDITY_HOURS="${HOURS_UNTIL}"
+        EARLIEST_VALIDITY_DATE="${ELEM_END_DATE}"
+        EARLIEST_VALIDITY_ELEMENT="${el_number}"
+        DAYS_VALID="${ELEM_DAYS_VALID}"
         replace_current_message='yes'
         debuglog "    EARLIEST_VALIDITY_HOURS=${EARLIEST_VALIDITY_HOURS}"
-    fi
-
-    if [ -z "${DAYS_VALID}" ] || compare "${ELEM_DAYS_VALID}" "<" "${DAYS_VALID}"; then
-        DAYS_VALID="${ELEM_DAYS_VALID}"
-        DAYS_VALID_END_DATE="${ELEM_END_DATE}"
         debuglog "    DAYS_VALID=${DAYS_VALID}"
     fi
 
-    add_performance_data "days_chain_elem${el_number}=${ELEM_DAYS_VALID};${WARNING_DAYS};${CRITICAL_DAYS};;"
+    ELEM_WARNING_DAYS=${WARNING_DAYS}
+    ELEM_CRITICAL_DAYS=${CRITICAL_DAYS}
+    ELEM_WARNING_SECONDS=${WARNING_SECONDS}
+    ELEM_CRITICAL_SECONDS=${CRITICAL_SECONDS}
+
+    case "${WARNING_DAYS}:${CRITICAL_DAYS}" in
+    *%*)
+        ELEM_END_SECONDS=${DATE_SECONDS}
+        ELEM_END_HOURS=${HOURS_UNTIL}
+        ELEM_START_DATE=$(extract_cert_attribute 'startdate' "$1")
+        hours_until "${ELEM_START_DATE}"
+        ELEM_LIFETIME_SECONDS=$((ELEM_END_SECONDS - DATE_SECONDS))
+        # Restore the remaining hours used to compare chain elements.
+        HOURS_UNTIL=${ELEM_END_HOURS}
+        if [ "${ELEM_LIFETIME_SECONDS}" -le 0 ]; then
+            unknown "Cannot compute percentage thresholds: invalid certificate lifetime"
+        fi
+        case "${WARNING_DAYS}" in
+        *%)
+            ELEM_WARNING_SECONDS=$(compute "${ELEM_LIFETIME_SECONDS} * ${WARNING_DAYS%\%} / 100" 0)
+            ELEM_WARNING_DAYS=$(compute "${ELEM_WARNING_SECONDS}/86400" 8)
+            ;;
+        *) ;;
+        esac
+        case "${CRITICAL_DAYS}" in
+        *%)
+            ELEM_CRITICAL_SECONDS=$(compute "${ELEM_LIFETIME_SECONDS} * ${CRITICAL_DAYS%\%} / 100" 0)
+            ELEM_CRITICAL_DAYS=$(compute "${ELEM_CRITICAL_SECONDS}/86400" 8)
+            ;;
+        *) ;;
+        esac
+        if compare "${ELEM_WARNING_SECONDS}" '<' "${ELEM_CRITICAL_SECONDS}"; then
+            unknown "--warning (${WARNING_DAYS}) is less than --critical (${CRITICAL_DAYS}) for certificate element ${el_number}"
+        fi
+        ;;
+    *) ;;
+    esac
+
+    add_performance_data "days_chain_elem${el_number}=${ELEM_DAYS_VALID};${ELEM_WARNING_DAYS};${ELEM_CRITICAL_DAYS};;"
 
     if [ "${OPENSSL_COMMAND}" = "x509" ]; then
 
@@ -2523,11 +2578,11 @@ ${CN_EXPIRED_TMP}"
             return 2
         fi
 
-        if [ -n "${CRITICAL_DAYS}" ] && [ -n "${CRITICAL_SECONDS}" ]; then
+        if [ -n "${ELEM_CRITICAL_DAYS}" ] && [ -n "${ELEM_CRITICAL_SECONDS}" ]; then
 
-            debuglog "executing: ${OPENSSL} x509 -in /dev/stdin -noout -checkend ${CRITICAL_SECONDS} on cert element ${el_number} (${element_cn})"
+            debuglog "executing: ${OPENSSL} x509 -in /dev/stdin -noout -checkend ${ELEM_CRITICAL_SECONDS} on cert element ${el_number} (${element_cn})"
 
-            if ! checkend "${1}" "${CRITICAL_SECONDS}"; then
+            if ! checkend "${1}" "${ELEM_CRITICAL_SECONDS}"; then
                 debuglog "CRITICAL: certificate element ${el_number} (${element_cn}) will expire in ${ELEM_DAYS_VALID} day(s) on ${ELEM_END_DATE}"
                 CN_EXPIRED_TMP="${element_cn}:${replace_current_message}:${OPENSSL_COMMAND} certificate element ${el_number} (${element_cn}) will expire in ${ELEM_DAYS_VALID} day(s) on ${ELEM_END_DATE}"
                 if [ -z "${CN_EXPIRED_CRITICAL}" ]; then
@@ -2545,12 +2600,12 @@ ${CN_EXPIRED_TMP}"
 
         fi
 
-        if [ -n "${WARNING_DAYS}" ] && [ -n "${WARNING_SECONDS}" ]; then
+        if [ -n "${ELEM_WARNING_DAYS}" ] && [ -n "${ELEM_WARNING_SECONDS}" ]; then
 
-            debuglog "executing: ${OPENSSL} x509 -in /dev/stdin -noout -checkend ${WARNING_SECONDS} on cert element ${el_number}"
+            debuglog "executing: ${OPENSSL} x509 -in /dev/stdin -noout -checkend ${ELEM_WARNING_SECONDS} on cert element ${el_number}"
 
-            #            if ! echo "${1}" | ${OPENSSL} x509 -in /dev/stdin -noout -checkend "${WARNING_SECONDS}" >/dev/null; then
-            if ! checkend "${1}" "${WARNING_SECONDS}"; then
+            #            if ! echo "${1}" | ${OPENSSL} x509 -in /dev/stdin -noout -checkend "${ELEM_WARNING_SECONDS}" >/dev/null; then
+            if ! checkend "${1}" "${ELEM_WARNING_SECONDS}"; then
                 debuglog "WARNING: certificate element ${el_number} (${element_cn}) will expire in ${ELEM_DAYS_VALID} day(s) on ${ELEM_END_DATE}"
                 CN_EXPIRED_TMP="${element_cn}:${replace_current_message}:${OPENSSL_COMMAND} certificate element ${el_number} (${element_cn}) will expire in ${ELEM_DAYS_VALID} day(s) on ${ELEM_END_DATE}"
                 if [ -z "${CN_EXPIRED_WARNING}" ]; then
@@ -2590,9 +2645,9 @@ ${CN_EXPIRED_TMP}"
             return 2
         fi
 
-        if [ -n "${CRITICAL_DAYS}" ] && [ -n "${CRITICAL_SECONDS}" ]; then
+        if [ -n "${ELEM_CRITICAL_DAYS}" ] && [ -n "${ELEM_CRITICAL_SECONDS}" ]; then
             # When comparing, always use values in seconds, because values in days might be floating point numbers
-            if compare "${ELEM_SECONDS_VALID}" '<' "${CRITICAL_SECONDS}"; then
+            if compare "${ELEM_SECONDS_VALID}" '<' "${ELEM_CRITICAL_SECONDS}"; then
                 prepend_critical_message "${OPENSSL_COMMAND} certificate element ${el_number} (${element_cn}) will expire in ${ELEM_DAYS_VALID} day(s) on ${ELEM_END_DATE}" "${replace_current_message}"
                 if [ -z "${CN}" ]; then
                     CN='unavailable'
@@ -2603,9 +2658,9 @@ ${CN_EXPIRED_TMP}"
 
         fi
 
-        if [ -n "${WARNING_DAYS}" ] && [ -n "${WARNING_SECONDS}" ]; then
+        if [ -n "${ELEM_WARNING_DAYS}" ] && [ -n "${ELEM_WARNING_SECONDS}" ]; then
             # When comparing, always use values in seconds, because values in days might be floating point numbers
-            if compare "${ELEM_SECONDS_VALID}" '<' "${WARNING_SECONDS}"; then
+            if compare "${ELEM_SECONDS_VALID}" '<' "${ELEM_WARNING_SECONDS}"; then
                 append_warning_message "${OPENSSL_COMMAND} certificate element ${el_number} (${element_cn}) will expire in ${ELEM_DAYS_VALID} day(s) on ${ELEM_END_DATE}" "${replace_current_message}"
                 if [ -z "${CN}" ]; then
                     CN='unavailable'
@@ -3706,7 +3761,7 @@ parse_command_line_options() {
             check_option "${CRITICAL_SPECIFIED}" '-c,--critical'
             CRITICAL_SPECIFIED=1
             check_option_argument '-c,--critical' "$2"
-            check_numeric_argument "$2" "--critical: the number of days should be an integer or a float"
+            check_numeric_argument "$2" "--critical: expected days or a percentage between 0% and 100%"
             CRITICAL_DAYS="$2"
             CRITICAL_SECONDS=$(days_to_seconds "${CRITICAL_DAYS}")
             shift 2
@@ -4170,7 +4225,7 @@ $2"
             check_option "${WARNING_SPECIFIED}" '--warning'
             WARNING_SPECIFIED=1
             check_option_argument '-w|--warning' "$2"
-            check_numeric_argument "$2" "--warning: the number of days should be an integer or a float"
+            check_numeric_argument "$2" "--warning: expected days or a percentage between 0% and 100%"
             WARNING_DAYS="$2"
             WARNING_SECONDS=$(days_to_seconds "${WARNING_DAYS}")
             shift 2
@@ -5265,7 +5320,7 @@ main() {
 
         debuglog "-c specified: ${CRITICAL_DAYS}"
 
-        if ! echo "${CRITICAL_DAYS}" | "${GREP_BIN}" -E -q '^[0-9][0-9]*(\.[0-9][0-9]*)?$'; then
+        if ! echo "${CRITICAL_DAYS}" | "${GREP_BIN}" -E -q '^[0-9][0-9]*(\.[0-9][0-9]*)?%?$'; then
             unknown "invalid number of days '${CRITICAL_DAYS}'"
         fi
 
@@ -5280,7 +5335,7 @@ main() {
 
         debuglog "-w specified: ${WARNING_DAYS}"
 
-        if ! echo "${WARNING_DAYS}" | "${GREP_BIN}" -E -q '^[0-9][0-9]*(\.[0-9][0-9]*)?$'; then
+        if ! echo "${WARNING_DAYS}" | "${GREP_BIN}" -E -q '^[0-9][0-9]*(\.[0-9][0-9]*)?%?$'; then
             unknown "invalid number of days '${WARNING_DAYS}'"
         fi
 
@@ -7458,6 +7513,8 @@ ${WARNING}"
         fi
 
         if [ -n "${DAYS_VALID}" ]; then
+            DATE="${EARLIEST_VALIDITY_DATE}"
+
             # nicer formatting
             if compare "${DAYS_VALID}" '>=' 1; then
                 DAYS_VALID=" (expires in ${DAYS_VALID} days)"
@@ -7497,6 +7554,8 @@ ${WARNING}"
         if [ -z "${FORMAT}" ]; then
             if [ -n "${TERSE}" ]; then
                 FORMAT="%SHORTNAME% OK %CN% %DAYS_VALID%"
+            elif [ "${EARLIEST_VALIDITY_ELEMENT}" -gt 1 ]; then
+                FORMAT="${DEFAULT_FORMAT_PREFIX}, chain element ${EARLIEST_VALIDITY_ELEMENT}${DEFAULT_FORMAT_SUFFIX}"
             else
                 FORMAT="${DEFAULT_FORMAT}"
             fi
